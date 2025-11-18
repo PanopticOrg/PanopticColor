@@ -173,7 +173,7 @@ class ColorsPlugin(APlugin):
         # Créer les propriétés
         properties = []
         for letter in ['R', 'G', 'B', 'H', 'S', 'V', 'L']:
-            prop = self.project.create_property(
+            prop = await self.project.get_or_create_property(
                 "color_" + letter,
                 PropertyType.number,
                 PropertyMode.sha1
@@ -198,15 +198,13 @@ class ColorsPlugin(APlugin):
 
 
 def get_main_color(image_path, n_colors=1):
-    image = cv2.imread(image_path)
-    # Si cv2.imread échoue, essayer avec PIL
-    if image is None:
-        pil_image = Image.open(image_path)
-        # Convertir PIL en array numpy
-        image = np.array(pil_image)
-        # Convertir RGB -> BGR si nécessaire
-        if len(image.shape) == 3 and image.shape[2] == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+    pil_image = Image.open(image_path)
+    # Convertir PIL en array numpy
+    image = np.array(pil_image)
+    # Convertir RGB -> BGR si nécessaire
+    if len(image.shape) == 3 and image.shape[2] == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
     # Vérifier que l'image est valide
     if image is None or image.size == 0:
