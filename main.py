@@ -24,9 +24,12 @@ class ColorsPlugin(APlugin):
 
         for i in uniques:
             # Utiliser run_async pour éviter de bloquer le thread principal
-            rgb_array = await self.project.run_async(get_main_color, i.url)
-            values = step(rgb_array, 8)
-            res[i.sha1] = values
+            try:
+                rgb_array = await self.project.run_async(get_main_color, i.url)
+                values = step(rgb_array, 8)
+                res[i.sha1] = values
+            except:
+                print("error for image ", i.url) 
 
         await self.save_values(res)
 
