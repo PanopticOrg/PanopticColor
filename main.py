@@ -1,266 +1,318 @@
-from pydantic import BaseModel
-import cv2
-import math
 import colorsys
-from PIL import Image
+import io
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
+
+import msgspec
 import numpy as np
-from sklearn.cluster import KMeans
+from PIL import Image
+
+from panoptic.core.databases.data.models import DataCommit, Property, Sha1Value
+from panoptic.core.databases.media.models import Map
 from panoptic.core.plugin.plugin import APlugin
-from panoptic.models import ActionContext, PropertyType, PropertyMode, DbCommit, Instance, ImageProperty, Property
-from panoptic.models.results import ActionResult, Notif, NotifType, Group, Score, ScoreList
-from panoptic.core.plugin.plugin_project_interface import PluginProjectInterface
+from panoptic.core.task.task import Task
+from panoptic.models.action_models import (
+    ActionContext, ActionResult, Group, Notif, NotifType, ScoreList,
+)
+
+PROPERTY_PREFIX = 'color_'
+PROPERTY_GROUP = 'Colors'
+BATCH_SIZE = 500
+IO_WORKERS = 8
+
+
+class ColorComponent(Enum):
+    hue = 'Hue'
+    saturation = 'Saturation'
+    value = 'Value'
+    luminance = 'Luminance'
+    red = 'Red'
+    green = 'Green'
+    blue = 'Blue'
+
+
+class ColorSpace(Enum):
+    rgb = 'RGB'
+    hsv = 'HSV'
+    all = 'ALL'
+
+
+# component -> (property letter, min, max)
+COMPONENTS = {
+    ColorComponent.red: ('R', 0, 255),
+    ColorComponent.green: ('G', 0, 255),
+    ColorComponent.blue: ('B', 0, 255),
+    ColorComponent.hue: ('H', 0, 360),
+    ColorComponent.saturation: ('S', 0, 100),
+    ColorComponent.value: ('V', 0, 100),
+    ColorComponent.luminance: ('L', 0, 100),
+}
+LETTERS = [letter for letter, _, _ in COMPONENTS.values()]
 
 
 class ColorsPlugin(APlugin):
-    def __init__(self, project: PluginProjectInterface, plugin_path: str, name: str):
+    """
+    Computes the mean color of images (RGB, HSV and perceived luminance) and stores it in
+    color_* properties, to filter, sort, group or lay out images by color.
+    """
+
+    def __init__(self, name: str, project, plugin_path: str):
         super().__init__(name=name, project=project, plugin_path=plugin_path)
+        self._props_lock = threading.Lock()
         self.add_action_easy(self.compute_colors, ['execute'])
         self.add_action_easy(self.cluster_by_colors, ['group'])
+        self.add_action_easy(self.color_map, ['map', 'execute'])
 
-    async def compute_colors(self, context: ActionContext):
-        instances = await self.project.get_instances(ids=context.instance_ids)
-        uniques = list({i.sha1: i for i in instances}.values())
-        res = {}
+    def compute_colors(self, context: ActionContext) -> ActionResult:
+        """Compute the mean color of the selected images and store it in color_* properties."""
+        sha1s = self._get_sha1s(context)
+        if sha1s:
+            self.project.add_task(ComputeColorsTask(self, sha1s))
+        return ActionResult(notifs=[Notif(
+            NotifType.INFO, name='compute_colors',
+            message=f'Started computing colors for {len(sha1s)} images',
+        )])
 
-        for i in uniques:
-            # Utiliser run_async pour éviter de bloquer le thread principal
-            try:
-                rgb_array = await self.project.run_async(get_main_color, i.url)
-                values = step(rgb_array, 8)
-                res[i.sha1] = values
-            except:
-                print("error for image ", i.url) 
-
-        await self.save_values(res)
-
-        # Retourner un ActionResult avec une notification de succès
-        notif = Notif(
-            type=NotifType.INFO,
-            name='compute_colors',
-            message=f'Couleurs calculées pour {len(uniques)} images'
-        )
-        return ActionResult(notifs=[notif])
-
-    async def cluster_by_colors(self, context: ActionContext, nb_clusters: int = 5, color_space: str = "RGB"):
+    def cluster_by_colors(self, context: ActionContext, nb_clusters: int = 5,
+                          color_space: ColorSpace = ColorSpace.rgb) -> ActionResult:
+        """Cluster images by their mean color with K-means.
+        @nb_clusters: number of clusters to create
+        @color_space: color space the distances are computed in
         """
-        Crée des clusters d'images basés sur leurs couleurs dominantes.
+        colors = self._ensure_colors(self._get_sha1s(context))
+        if len(colors) < nb_clusters:
+            return ActionResult(notifs=[Notif(
+                NotifType.WARNING, name='cluster_by_colors',
+                message=f'Not enough images with colors ({len(colors)}) to create {nb_clusters} clusters.',
+            )])
 
-        :param context: Contexte de l'action contenant les IDs des instances
-        :param nb_clusters: Nombre de clusters à créer
-        :param color_space: Espace colorimétrique à utiliser ('RGB', 'HSV', ou 'ALL')
-        """
-        # Récupérer les instances
-        instances = await self.project.get_instances(ids=context.instance_ids)
+        sha1s = list(colors.keys())
+        features = np.array([to_features(colors[s], color_space) for s in sha1s])
+        labels, centers = self.project.run_in_executor(kmeans, features, nb_clusters)
+        distances = np.linalg.norm(features - centers[labels], axis=1)
 
-        # Récupérer les propriétés de couleur
-        all_properties = await self.project.get_properties()
-        color_props = {p.name: p for p in all_properties if p.name.startswith('color_')}
-
-        # Vérifier que les propriétés de couleur existent
-        if not color_props:
-            notif = Notif(
-                type=NotifType.ERROR,
-                name='cluster_by_colors',
-                message='Aucune propriété de couleur trouvée. Veuillez d\'abord calculer les couleurs.'
-            )
-            return ActionResult(notifs=[notif])
-
-        # Récupérer les valeurs de propriétés pour les instances
-        instance_ids = [i.id for i in instances]
-        property_ids = [p.id for p in color_props.values()]
-        values = await self.project.get_image_property_values(
-            property_ids=property_ids,
-            sha1s=[i.sha1 for i in instances]
-        )
-
-        # Organiser les données : sha1 -> {property_name: value}
-        sha1_to_colors = {}
-        for value in values:
-            sha1 = value.sha1
-            prop_name = next((name for name, p in color_props.items() if p.id == value.property_id), None)
-            if sha1 not in sha1_to_colors:
-                sha1_to_colors[sha1] = {}
-            if prop_name:
-                sha1_to_colors[sha1][prop_name] = value.value
-
-        # Filtrer les instances qui ont des valeurs de couleur
-        instances_with_colors = [i for i in instances if i.sha1 in sha1_to_colors and len(sha1_to_colors[i.sha1]) >= 3]
-
-        if len(instances_with_colors) < nb_clusters:
-            notif = Notif(
-                type=NotifType.WARNING,
-                name='cluster_by_colors',
-                message=f'Pas assez d\'images avec des couleurs ({len(instances_with_colors)}) pour créer {nb_clusters} clusters.'
-            )
-            return ActionResult(notifs=[notif])
-
-        # Préparer les vecteurs de features selon l'espace colorimétrique
-        feature_vectors = []
-        for instance in instances_with_colors:
-            colors = sha1_to_colors[instance.sha1]
-
-            if color_space == "RGB":
-                features = [
-                    colors.get('color_R', 0),
-                    colors.get('color_G', 0),
-                    colors.get('color_B', 0)
-                ]
-            elif color_space == "HSV":
-                features = [
-                    colors.get('color_H', 0),
-                    colors.get('color_S', 0),
-                    colors.get('color_V', 0)
-                ]
-            else:  # ALL
-                features = [
-                    colors.get('color_R', 0),
-                    colors.get('color_G', 0),
-                    colors.get('color_B', 0),
-                    colors.get('color_H', 0),
-                    colors.get('color_S', 0),
-                    colors.get('color_V', 0),
-                    colors.get('color_L', 0)
-                ]
-
-            feature_vectors.append(features)
-
-        # Effectuer le clustering
-        feature_array = np.array(feature_vectors)
-        cluster_labels, cluster_centers = await self.project.run_async(
-            perform_kmeans_clustering,
-            feature_array,
-            nb_clusters
-        )
-
-        # Organiser les résultats par cluster
-        cluster_groups = {}
-        for idx, label in enumerate(cluster_labels):
-            if label not in cluster_groups:
-                cluster_groups[label] = []
-            instance = instances_with_colors[idx]
-            cluster_groups[label].append({
-                'id': instance.id,
-                'distance': np.linalg.norm(feature_array[idx] - cluster_centers[label])
-            })
-
-        # Créer les objets Group pour l'interface
         groups = []
-        for cluster_id in sorted(cluster_groups.keys()):
-            cluster_items = cluster_groups[cluster_id]
-
-            # Trier par distance au centre (les plus proches d'abord)
-            cluster_items.sort(key=lambda x: x['distance'])
-
-            ids = [item['id'] for item in cluster_items]
-
-            # Obtenir les couleurs moyennes du cluster
-            center = cluster_centers[cluster_id]
-            if color_space == "RGB":
-                color_desc = f"RGB({int(center[0])}, {int(center[1])}, {int(center[2])})"
-            elif color_space == "HSV":
-                color_desc = f"HSV({int(center[0])}, {int(center[1])}, {int(center[2])})"
-            else:
-                color_desc = f"RGB({int(center[0])}, {int(center[1])}, {int(center[2])})"
-
-            group = Group(
-                ids=ids,
-                name=f"Cluster {cluster_id + 1}: {color_desc}",
-            )
-            groups.append(group)
-
+        for cluster in range(nb_clusters):
+            members = sorted(np.flatnonzero(labels == cluster), key=lambda i: distances[i])
+            if not members:
+                continue
+            rgb = np.mean([[colors[sha1s[i]][c] for c in 'RGB'] for i in members], axis=0)
+            groups.append(Group(
+                sha1s=[sha1s[i] for i in members],
+                scores=ScoreList(values=[float(distances[i]) for i in members],
+                                 min=0, max=float(distances.max()) or 1, max_is_best=False,
+                                 description='Distance to the cluster center'),
+                name=f'Cluster {len(groups) + 1}: {rgb_to_hex(rgb)}',
+            ))
         return ActionResult(groups=groups)
 
-    async def save_values(self, colors):
-        commit = DbCommit()
+    def color_map(self, context: ActionContext, x_axis: ColorComponent = ColorComponent.hue,
+                  y_axis: ColorComponent = ColorComponent.saturation, radial: bool = False,
+                  reverse_x: bool = False, reverse_y: bool = False, map_name: str = '') -> ActionResult:
+        """Create a spatial view placing images by two color components.
+        @x_axis: color component on the horizontal axis (the angle in radial layout)
+        @y_axis: color component on the vertical axis (the distance to the center in radial layout)
+        @radial: radial layout, e.g. a color wheel with Hue and Saturation
+        @reverse_x: reverse the horizontal axis (the direction of rotation in radial layout)
+        @reverse_y: reverse the vertical axis (highest values at the center in radial layout)
+        @map_name: name for the saved map (auto-generated if empty)
+        """
+        colors = self._ensure_colors(self._get_sha1s(context))
+        if not colors:
+            return ActionResult(notifs=[Notif(
+                NotifType.ERROR, name='color_map', message='No image color could be computed',
+            )])
 
-        # Créer les propriétés
-        properties = []
-        for letter in ['R', 'G', 'B', 'H', 'S', 'V', 'L']:
-            prop = await self.project.get_or_create_property(
-                "color_" + letter,
-                PropertyType.number,
-                PropertyMode.sha1
-            )
-            properties.append(prop)
+        position = radial_position if radial else cartesian_position
+        flat = []
+        for sha1, values in colors.items():
+            u = normalize(values, x_axis, reverse_x)
+            v = normalize(values, y_axis, reverse_y)
+            flat += [sha1, *position(u, v)]
+        default_name = f'color{" radial" if radial else ""}: {x_axis.value} / {y_axis.value}'
+        point_map = self.project.upsert_map(Map(
+            id=-1, source=self.name, name=map_name or default_name,
+            key='sha1', count=len(colors), data=flat,
+        ))
+        return ActionResult(value=msgspec.structs.asdict(point_map))
 
-        commit.properties.extend(properties)
+    def compute_and_save(self, sha1s: list[str]) -> dict[str, dict]:
+        colors = compute_colors(self.project, sha1s)
+        self._save_colors(colors)
+        return colors
 
-        # Ajouter les valeurs pour chaque image
-        for sha1 in colors:
-            for index, prop in enumerate(properties):
-                commit.image_values.append(
-                    ImageProperty(
-                        property_id=prop.id,
-                        sha1=sha1,
-                        value=colors[sha1][index]
+    def _ensure_colors(self, sha1s: list[str]) -> dict[str, dict]:
+        """Stored colors of `sha1s`, computing the missing ones."""
+        colors = self._read_colors(sha1s)
+        missing = [s for s in sha1s if s not in colors]
+        if missing:
+            colors.update(self.compute_and_save(missing))
+        return colors
+
+    def _read_colors(self, sha1s: list[str]) -> dict[str, dict]:
+        props = self._get_properties(create=False)
+        if len(props) < len(LETTERS) or not sha1s:
+            return {}
+        letter_by_id = {p.id: letter for letter, p in props.items()}
+        values = self.project.get_sha1_values(property_id=list(letter_by_id), sha1=sha1s)
+        colors: dict[str, dict] = {}
+        for v in values:
+            if v.value is not None:
+                colors.setdefault(v.sha1, {})[letter_by_id[v.property_id]] = v.value
+        return {s: c for s, c in colors.items() if len(c) == len(LETTERS)}
+
+    def _save_colors(self, colors: dict[str, dict]) -> None:
+        if not colors:
+            return
+        props = self._get_properties(create=True)
+        commit = DataCommit(sha1_values=[
+            Sha1Value(property_id=props[letter].id, sha1=sha1, value=values[letter])
+            for sha1, values in colors.items() for letter in LETTERS
+        ])
+        self.project.apply_commit(commit)
+
+    def _get_properties(self, create: bool) -> dict[str, Property]:
+        with self._props_lock:
+            existing = {p.name: p for p in self.project.get_properties()
+                        if p.dtype == 'number' and p.mode == 'sha1'}
+            props = {letter: existing[PROPERTY_PREFIX + letter] for letter in LETTERS
+                     if PROPERTY_PREFIX + letter in existing}
+            if not create:
+                return props
+
+            group_id = self._get_group_id()
+            ungrouped = [msgspec.structs.replace(p, property_group_id=group_id)
+                         for p in props.values() if p.property_group_id is None]
+            if group_id is not None and ungrouped:
+                self.project.apply_commit(DataCommit(properties=ungrouped))
+            for letter in LETTERS:
+                if letter not in props:
+                    props[letter] = self.project.add_property(
+                        PROPERTY_PREFIX + letter, 'number', 'sha1',
+                        readonly=True, property_group_id=group_id,
                     )
-                )
+            return props
 
-        # Utiliser do() pour permettre l'annulation/rétablissement
-        await self.project.do(commit)
+    def _get_group_id(self) -> int | None:
+        # older Panoptic versions don't let plugins manage property groups
+        if not hasattr(self.project, 'add_property_group'):
+            return None
+        group = next((g for g in self.project.get_property_groups() if g.name == PROPERTY_GROUP), None)
+        return (group or self.project.add_property_group(PROPERTY_GROUP)).id
+
+    def _get_sha1s(self, context: ActionContext) -> list[str]:
+        if context.instance_ids:
+            instances = self.project.get_instances(id=context.instance_ids)
+        else:
+            instances = self.project.get_instances()
+        return list(dict.fromkeys(i.sha1 for i in instances if i.sha1))
 
 
-def get_main_color(image_path, n_colors=1):
+class ComputeColorsTask(Task):
+    def __init__(self, plugin: ColorsPlugin, sha1s: list[str]):
+        super().__init__()
+        self.plugin = plugin
+        self.sha1s = sha1s
+        self.name = 'Colors'
 
-    pil_image = Image.open(image_path)
-    # Convertir PIL en array numpy
-    image = np.array(pil_image)
-    # Convertir RGB -> BGR si nécessaire
-    if len(image.shape) == 3 and image.shape[2] == 3:
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    def start(self) -> None:
+        self.state.total = len(self.sha1s)
+        self._notify()
+        for i in range(0, len(self.sha1s), BATCH_SIZE):
+            if self.is_cancelled():
+                break
+            chunk = self.sha1s[i:i + BATCH_SIZE]
+            try:
+                colors = self.plugin.compute_and_save(chunk)
+            except Exception as e:
+                print(f'PanopticColor: failed to compute colors: {e!r}')
+                self.state.failed += len(chunk)
+                self._notify()
+                continue
+            self.state.done += len(colors)
+            self.state.failed += len(chunk) - len(colors)
+            self._notify()
 
-    # Vérifier que l'image est valide
-    if image is None or image.size == 0:
-        print(f"Erreur: impossible de charger l'image {image_path}")
+
+def compute_colors(project, sha1s: list[str]) -> dict[str, dict]:
+    """Color values of each sha1, computed from its smallest stored rendition."""
+    # The plugin interface has no public image access yet, hence _media_db().
+    with project._media_db() as db:
+        image_type = smallest_image_type(db.get_image_types())
+        if image_type is None:
+            return {}
+        images = db.get_images(type_id=image_type, sha1=sha1s)
+
+    def compute(image):
+        try:
+            return image.sha1, color_values(mean_rgb(image.data))
+        except Exception as e:
+            print(f'PanopticColor: cannot read image {image.sha1}: {e}')
+            return None
+
+    with ThreadPoolExecutor(max_workers=IO_WORKERS) as pool:
+        return dict(r for r in pool.map(compute, images) if r is not None)
+
+
+def smallest_image_type(image_types) -> int | None:
+    if not image_types:
         return None
-
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    # Redimensionner l'image pour accélérer le traitement
-    resized_image = cv2.resize(image_rgb, (100, 100), interpolation=cv2.INTER_AREA)
-    # Reshape pour préparer l'image au clustering
-    pixels = resized_image.reshape(-1, 3)
-    # Utilisation de KMeans pour trouver la couleur dominante
-    kmeans = KMeans(n_clusters=n_colors, n_init=10)
-    kmeans.fit(pixels)
-    # Récupérer la couleur centrale (la plus représentée)
-    main_color = kmeans.cluster_centers_[0].astype(int)
-    return main_color
+    return min(image_types, key=lambda t: max(t.width or math.inf, t.height or math.inf)).id
 
 
-def perform_kmeans_clustering(feature_array, n_clusters):
-    """
-    Effectue le clustering KMeans sur les features de couleur.
-    """
-    kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-    labels = kmeans.fit_predict(feature_array)
-    centers = kmeans.cluster_centers_
-    return labels, centers
+def mean_rgb(data: bytes) -> np.ndarray:
+    image = Image.open(io.BytesIO(data)).convert('RGB')
+    return np.asarray(image, dtype=np.float64).reshape(-1, 3).mean(axis=0)
 
 
-def rgb_to_hsl(rgb_arr):
-    # Extraire les valeurs R, G, B
-    R, G, B = rgb_arr
-    # Convertir en HSV (OpenCV attend l'image au format BGR)
-    main_color_bgr = np.uint8([[rgb_arr[::-1]]])  # Convertir en BGR pour OpenCV
-    hsv_color = cv2.cvtColor(main_color_bgr, cv2.COLOR_BGR2HSV)[0][0]
-
-    # Extraire les valeurs H, S, V
-    H, S, V = hsv_color
-
-    # Retourner les valeurs sous forme de dictionnaire
-    return [round(R), round(G), round(B), int(H), int(S), int(V)]
+def color_values(rgb) -> dict[str, int]:
+    r, g, b = (float(c) for c in rgb)
+    h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+    # perceived brightness, see https://www.alanzucconi.com/2015/09/30/colour-sorting/
+    lum = math.sqrt(.241 * r ** 2 + .691 * g ** 2 + .068 * b ** 2) / 255
+    return {
+        'R': round(r), 'G': round(g), 'B': round(b),
+        'H': round(h * 360) % 360, 'S': round(s * 100), 'V': round(v * 100), 'L': round(lum * 100),
+    }
 
 
-def step(rgb_arr, repetitions=1):
-    """
-    taken from https://www.alanzucconi.com/2015/09/30/colour-sorting/
-    """
-    r, g, b = rgb_arr
-    r_norm, g_norm, b_norm = r / 255, g / 255, b / 255
-    l = math.sqrt(.241 * r + .691 * g + .068 * b)
-    h, s, v = colorsys.rgb_to_hsv(r_norm, g_norm, b_norm)
-    h2 = int(h * repetitions)
-    l2 = int(l * repetitions)
-    v2 = int(v * repetitions)
-    s2 = int(s * repetitions)
-    return [int(r), int(g), int(b), h2, v2, s2, l2]
+def to_features(values: dict, color_space: ColorSpace) -> list[float]:
+    rgb = [values[c] / 255 * 100 for c in 'RGB']
+    # hue is circular: place colors in the HSV cone so that 359° is next to 0°
+    angle = math.radians(values['H'])
+    hsv = [values['S'] * math.cos(angle), values['S'] * math.sin(angle), values['V']]
+    if color_space == ColorSpace.rgb:
+        return rgb
+    if color_space == ColorSpace.hsv:
+        return hsv
+    return rgb + hsv + [values['L']]
+
+
+def normalize(values: dict, component: ColorComponent, reverse: bool = False) -> float:
+    """Component value mapped to [0, 1]."""
+    letter, lo, hi = COMPONENTS[component]
+    n = (values[letter] - lo) / (hi - lo)
+    return 1 - n if reverse else n
+
+
+# Panoptic maps fit in a disc of radius 100
+def cartesian_position(u: float, v: float) -> tuple[float, float]:
+    return u * 200 - 100, v * 200 - 100
+
+
+def radial_position(u: float, v: float) -> tuple[float, float]:
+    angle = u * 2 * math.pi
+    return v * 100 * math.cos(angle), v * 100 * math.sin(angle)
+
+
+def rgb_to_hex(rgb) -> str:
+    return '#' + ''.join(f'{int(round(c)):02x}' for c in rgb)
+
+
+def kmeans(features: np.ndarray, n_clusters: int):
+    from sklearn.cluster import KMeans
+    model = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+    labels = model.fit_predict(features)
+    return labels, model.cluster_centers_
